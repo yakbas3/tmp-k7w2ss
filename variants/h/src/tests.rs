@@ -23,6 +23,19 @@ fn cfg(threads: usize, chunk: usize, bits: u32) -> Config {
     }
 }
 
+thread_local! {
+    /// Set by the test that holds the event hash mask alone.
+    static MASK_IS_MINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Every engine run holds the event hash mask shared, see `ids`.
+fn mask_gate() -> Option<std::sync::RwLockReadGuard<'static, ()>> {
+    if MASK_IS_MINE.get() {
+        return None;
+    }
+    Some(crate::ids::EVENT_MASK_GATE.read().unwrap_or_else(|e| e.into_inner()))
+}
+
 fn compare(data: &Path, config: &Config) -> [i64; 5] {
     let lk = load_lookups(data);
     let want = naive::run(data, &lk);
@@ -46,6 +59,7 @@ fn compare(data: &Path, config: &Config) -> [i64; 5] {
 /// Run one shape and compare it with the reference; true when the dense
 /// shape ran to the end.
 fn check_shape(data: &Path, config: &Config, lk: &Lookups, want: &Tables) -> bool {
+    let _gate = mask_gate();
     let mut got = engine::run(data, None, lk, config, std::time::Instant::now()).expect("fast engine declined");
     got.sort();
     // The dense shape gives up only when its table fills or a click record
@@ -83,7 +97,7 @@ fn check_shape(data: &Path, config: &Config, lk: &Lookups, want: &Tables) -> boo
 
 fn fixtures_dir() -> Option<PathBuf> {
     let dir = std::env::var("SESSIONS_FIXTURES").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from("/Users/yamanakbas/Developer/buildathon-2026/tracks/shopping-sessions/kit/starter-duckdb/starter-duckdb/fixtures")
+        PathBuf::from("fixtures")
     });
     dir.is_dir().then_some(dir)
 }
@@ -1143,6 +1157,7 @@ fn dense_long_window_falls_back() {
             let want = naive::run(&dir, &lk);
             assert!(check_shape(&dir, &config, &lk, &want));
         } else {
+            let _gate = mask_gate();
             assert!(engine::run(&dir, None, &lk, &config, std::time::Instant::now()).is_none());
         }
     }
@@ -1199,4 +1214,349 @@ fn click_blocks_fill_across_long_lines() {
     assert_eq!(compare(&dir, &cfg(2, 300_000, 2)), a);
     assert!(a[3] > 100, "credited {}", a[3]);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One event ID of every shape the key code tells apart: packed, ten bytes,
+/// the generator's 32 hex digits after a short part, 64 bytes that differ
+/// only at the end, 300 that differ only at the start, short but not ASCII,
+/// IDs that are prefixes of each other, and 33 bytes.
+fn event_id(n: u64) -> String {
+    match n % 8 {
+        0 => format!("e{n}"),
+        1 => format!("L{n:09}"),
+        2 => format!("{n:x}{:032x}", u128::from(n).wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835)),
+        3 => format!("{n:064}"),
+        4 => format!("{n}-{}", "q".repeat(300)),
+        5 => format!("\u{e9}{n}"),
+        6 => format!("{}{n}", "p".repeat(20)),
+        _ => format!("thirty-three-bytes-of-event-{n:05}"),
+    }
+}
+
+/// A dataset whose events carry the IDs of `event_id`, most of them in
+/// several copies spread over three files in any order: later copies, an
+/// invalid earliest copy, a valid earliest and invalid later ones, ingests
+/// far from the window or not timestamps (the out-of-line path), equal
+/// ingests. One 33 byte ID has 2000 copies. With `giant`, two IDs larger
+/// than a block of copies that differ in their last byte, one in three
+/// copies. Clicks have long IDs too, in pairs on one timestamp.
+fn long_id_dataset(dir: &Path, seed: u64, events: u64, giant: bool) {
+    let mut r = Rng(seed + 7000);
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let ws = days_from_civil(2026, 10, 1) * DAY_MS;
+    let we = ws + 14 * DAY_MS;
+    std::fs::write(dir.join("manifest.json"), format!("{{\"window_start\": \"{}Z\", \"window_end\": \"{}Z\"}}\n", utc(ws), utc(we))).unwrap();
+    std::fs::write(dir.join("products.csv"), "product_id,category\np1,shoes\np2,books\np3,toys\n").unwrap();
+    std::fs::write(dir.join("campaigns.csv"), "campaign_id,channel\nc_1,search\nc_2,social\nc_3,email\n").unwrap();
+    let users: Vec<String> = (0..80).map(|j| if j % 5 == 0 { format!("user-with-a-long-name-{j:04}") } else { format!("u{j}") }).collect();
+    let links: Vec<String> = (0..20).map(|j| format!("{},{}", users[j * 3 + 1], users[j * 3])).collect();
+    let line = |r: &mut Rng, id: &str, user: &str, ts: &str, ingest: &str, kind: &str, prod: &str, price: &str| -> String {
+        [id, user, ts, ingest, kind, prod, price].iter().map(|f| quoted(r, f)).collect::<Vec<_>>().join(",")
+    };
+    let f1 = |ms: i64| format!("{}Z", utc(ms));
+    let mut lines: Vec<String> = Vec::new();
+    for n in 0..events {
+        let id = event_id(n);
+        let t = ws + DAY_MS + r.below((we - ws) as u64 - 2 * DAY_MS as u64) as i64;
+        let ts = format!("{t}");
+        let kind = if r.chance(4) { "purchase" } else if r.chance(2) { "cart" } else { "view" };
+        let prod = format!("p{}", 1 + r.below(4));
+        let price = format!("{}", 100 + r.below(900));
+        let u = users[r.below(users.len() as u64) as usize].clone();
+        let alt = users[r.below(users.len() as u64) as usize].clone();
+        let ingest = t - t.rem_euclid(1000) + 1000 * (1 + r.below(600) as i64);
+        match n / 8 % 6 {
+            0 => lines.push(line(&mut r, &id, &u, &ts, &f1(ingest), kind, &prod, &price)),
+            1 => {
+                for c in 0..2 + r.below(3) as i64 {
+                    let who = if c % 2 == 0 { &u } else { &alt };
+                    let at = ingest + c * 1000 * (1 + r.below(600) as i64);
+                    lines.push(line(&mut r, &id, who, &ts, &f1(at), kind, &prod, &price));
+                }
+            }
+            2 => {
+                lines.push(line(&mut r, &id, &u, &ts, &f1(ingest), "Purchase", &prod, &price));
+                for c in 1..2 + r.below(3) as i64 {
+                    lines.push(line(&mut r, &id, &u, &ts, &f1(ingest + c * 1000), kind, &prod, &price));
+                }
+            }
+            3 => {
+                lines.push(line(&mut r, &id, &u, &ts, &f1(ingest), kind, &prod, &price));
+                lines.push(line(&mut r, &id, "", &ts, &f1(ingest + 1000), kind, &prod, &price));
+                lines.push(line(&mut r, &id, &alt, &ts, &f1(ingest + 2000), "Cart", &prod, &price));
+            }
+            4 => {
+                let far = if r.chance(2) { days_from_civil(1940, 5, 1) * DAY_MS } else { days_from_civil(2200, 1, 1) * DAY_MS };
+                lines.push(line(&mut r, &id, &u, &ts, &f1(far + 7000), kind, &prod, &price));
+                lines.push(line(&mut r, &id, &alt, &ts, &f1(ingest), kind, &prod, &price));
+                lines.push(line(&mut r, &id, &u, &ts, "garbage", kind, &prod, &price));
+                lines.push(line(&mut r, &id, &u, &ts, &format!("{}", far + 7001), kind, &prod, &price));
+            }
+            _ => {
+                for _ in 0..2 + r.below(3) {
+                    lines.push(line(&mut r, &id, &u, &ts, &f1(ingest), kind, &prod, &price));
+                }
+                lines.push(line(&mut r, &id, &alt, &ts, &f1(ingest + 1000), kind, &prod, &price));
+            }
+        }
+    }
+    let hot = "hot-event-of-thirty-three-bytes-0";
+    let hot_t = ws + 3 * DAY_MS + 12_345;
+    let mut order: Vec<i64> = (0..2000).collect();
+    shuffle(&mut r, &mut order);
+    for c in order {
+        let kind = if c == 0 && seed % 2 == 1 { "Purchase" } else if c % 7 == 3 { "bogus" } else { "view" };
+        let u = users[r.below(users.len() as u64) as usize].clone();
+        lines.push(line(&mut r, hot, &u, &format!("{hot_t}"), &f1(hot_t - 12_345 + 60_000 + c * 1000), kind, "p1", ""));
+    }
+    if giant {
+        let body = "g".repeat((1 << 20) + 4000);
+        let t = ws + 5 * DAY_MS;
+        for (c, who) in [(2, 3), (0, 7), (1, 11)] {
+            lines.push(format!("{body}A,{},{t},{},view,p2,", users[who], f1(t + 5000 + c * 1000)));
+        }
+        lines.push(format!("{body}B,{},{t},{},cart,p3,", users[13], f1(t + 9000)));
+    }
+    shuffle(&mut r, &mut lines);
+    let mut bodies: Vec<Vec<u8>> = vec![Vec::new(); 3];
+    for l in &lines {
+        let f = r.below(3) as usize;
+        bodies[f].extend_from_slice(l.as_bytes());
+        bodies[f].push(b'\n');
+    }
+    write_parts(&dir.join("events"), "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents", bodies, false);
+
+    let mut clicks = String::new();
+    for k in 0..400u64 {
+        let who = &users[r.below(users.len() as u64) as usize];
+        let t = ws - 3 * DAY_MS + r.below(16 * DAY_MS as u64) as i64;
+        // Two clicks on one timestamp: the bytewise smaller ID counts.
+        let (a, b) = (1 + r.below(3), 1 + r.below(3));
+        clicks.push_str(&format!("click-with-a-long-name-{:05}-b,{who},c_{a},{t}\n", k * 2));
+        clicks.push_str(&format!("click-with-a-long-name-{:05}-a,{who},c_{b},{t}\n", k * 2));
+        clicks.push_str(&format!("k{k},{who},c_{},{}\n", 1 + r.below(3), t - 1 - r.below(3_600_000) as i64));
+    }
+    write_parts(&dir.join("clicks"), "click_id,user_id,campaign_id,ts", vec![clicks.into_bytes()], false);
+    write_parts(&dir.join("links"), "user_id_a,user_id_b", vec![(links.join("\n") + "\n").into_bytes()], false);
+}
+
+/// Long event IDs of up to 128 bytes are not interned: every copy read
+/// gets a key of its own, so the copies of one event meet only through the
+/// byte compare. Longer ones (the giant IDs here) are interned. Threads
+/// from one to eight and chunks down to 256 bytes spread the copies of an
+/// ID over threads, chunks and files.
+#[test]
+fn long_event_ids_match_reference() {
+    let root = std::env::temp_dir().join(format!("sessions-long-ids-{}", std::process::id()));
+    let mut sessions = 0;
+    for seed in 0..6u64 {
+        let dir = root.join(format!("d{seed}"));
+        long_id_dataset(&dir, seed, 4000, seed % 3 == 0);
+        let (threads, chunk, bits) = match seed % 4 {
+            0 => (1, 4 << 20, 1),
+            1 => (4, 256, 4),
+            2 => (3, 5000, 2),
+            _ => (8, 1024, 3),
+        };
+        sessions += compare(&dir, &cfg(threads, chunk, bits))[2];
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(sessions > 10_000, "only {sessions} sessions");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Puts the event hash mask back when the test that changed it ends.
+struct MaskReset;
+
+impl Drop for MaskReset {
+    fn drop(&mut self) {
+        crate::ids::set_event_hash_mask(u64::MAX);
+        MASK_IS_MINE.set(false);
+    }
+}
+
+/// The same with the hash of a long event ID cut down by `mask`: the long
+/// IDs share their hash bits, land in one partition and one probe chain,
+/// and only the bytes tell them apart. Also the awkward random datasets.
+/// One mask a test: an engine run keeps its memory, and a test process
+/// must stay small.
+fn long_event_ids_under_mask(m: usize, mask: u64) {
+    let _alone = crate::ids::EVENT_MASK_GATE.write().unwrap_or_else(|e| e.into_inner());
+    MASK_IS_MINE.set(true);
+    let _reset = MaskReset;
+    let root = std::env::temp_dir().join(format!("sessions-long-ids-masked-{m}-{}", std::process::id()));
+    let mut sessions = 0;
+    crate::ids::set_event_hash_mask(mask);
+    for seed in 0..3u64 {
+        let dir = root.join(format!("m{m}d{seed}"));
+        long_id_dataset(&dir, seed + 40, if mask == 0 { 1200 } else { 3000 }, seed == 1 && m < 2);
+        let (threads, chunk, bits) = match (seed + m as u64) % 4 {
+            0 => (1, 4 << 20, 1),
+            1 => (4, 256, 4),
+            2 => (3, 5000, 2),
+            _ => (8, 1024, 3),
+        };
+        sessions += compare(&dir, &cfg(threads, chunk, bits))[2];
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir = root.join(format!("m{m}r{seed}"));
+        generate(&dir, seed + 900 + m as u64, 1500);
+        add_long_lines(&dir, seed);
+        compare(&dir, &cfg(4, 512, 3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(sessions > 1500, "only {sessions} sessions");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Every long event ID on the same hash bits.
+#[test]
+fn long_event_ids_with_no_hash_bits() {
+    long_event_ids_under_mask(0, 0);
+}
+
+/// A quarter of the long event IDs on each value of the hash bits.
+#[test]
+fn long_event_ids_with_two_hash_bits() {
+    long_event_ids_under_mask(1, 3 << 38);
+}
+
+/// Half of the long event IDs on each value of the hash bits.
+#[test]
+fn long_event_ids_with_one_hash_bit() {
+    long_event_ids_under_mask(2, 1 << 63);
+}
+
+/// Long event IDs in bulk, for runs on equal hash bits: IDs of one length
+/// that differ only at the end or only at the start, one letter repeated
+/// so that IDs differ only in length, and every shape of `event_id`. `pad`
+/// sets the length, so the copies one thread reads fill several blocks.
+/// The copies of an ID sit milliseconds apart around a whole second, in
+/// all three timestamp forms, and name different users. The earliest copy
+/// is invalid one time in five, and one copy in six is repeated as it is.
+/// Returns the bytes of all copies of long IDs.
+fn collide_dataset(dir: &Path, seed: u64, ids: u64, pad: usize) -> usize {
+    let mut r = Rng(seed + 8100);
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let ws = days_from_civil(2026, 10, 1) * DAY_MS;
+    let we = ws + 14 * DAY_MS;
+    std::fs::write(dir.join("manifest.json"), format!("{{\"window_start\": \"{}Z\", \"window_end\": \"{}Z\"}}\n", utc(ws), utc(we))).unwrap();
+    std::fs::write(dir.join("products.csv"), "product_id,category\np1,shoes\np2,books\np3,toys\n").unwrap();
+    std::fs::write(dir.join("campaigns.csv"), "campaign_id,channel\nc_1,search\nc_2,social\nc_3,email\n").unwrap();
+    let users: Vec<String> = (0..80).map(|j| if j % 5 == 0 { format!("user-with-a-long-name-{j:04}") } else { format!("u{j}") }).collect();
+    let links: Vec<String> = (0..20).map(|j| format!("{},{}", users[j * 3 + 1], users[j * 3])).collect();
+    let line = |r: &mut Rng, id: &str, user: &str, ts: &str, ingest: &str, kind: &str, prod: &str, price: &str| -> String {
+        [id, user, ts, ingest, kind, prod, price].iter().map(|f| quoted(r, f)).collect::<Vec<_>>().join(",")
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut long_bytes = 0;
+    for n in 0..ids {
+        let k = (n / 4) as usize;
+        let id = match n % 4 {
+            0 => event_id(n / 4),
+            1 => format!("{}{n:07}", "s".repeat(pad)),
+            2 => format!("{n:07}{}", "e".repeat(pad)),
+            _ if k < pad => "v".repeat(10 + k),
+            _ => format!("{}{n:07}", "w".repeat(pad / 2)),
+        };
+        let t = ws + DAY_MS + r.below((we - ws) as u64 - 2 * DAY_MS as u64) as i64;
+        let ts = format!("{t}");
+        let kind = if r.chance(4) { "purchase" } else if r.chance(2) { "cart" } else { "view" };
+        let prod = format!("p{}", 1 + r.below(4));
+        let price = format!("{}", 100 + r.below(900));
+        let base = t - t.rem_euclid(1000) + 1000 * (1 + r.below(600) as i64);
+        let mut offs = [0i64, 1, 2, 999, 1000, 1001, 59_999];
+        shuffle(&mut r, &mut offs);
+        let copies = 1 + r.below(4) as usize;
+        let first = *offs[..copies].iter().min().unwrap();
+        for &off in &offs[..copies] {
+            let who = users[r.below(users.len() as u64) as usize].clone();
+            let at = base + off;
+            // A whole second in any of the three forms, the rest in digits.
+            let ingest = if at % 1000 != 0 || r.chance(3) {
+                format!("{at}")
+            } else if r.chance(2) {
+                let offset = r.below(48) as i64 * 30 - 720;
+                let sign = if offset < 0 { '-' } else { '+' };
+                format!("{}{sign}{:02}:{:02}", utc(at + offset * 60_000), offset.abs() / 60, offset.abs() % 60)
+            } else {
+                format!("{}Z", utc(at))
+            };
+            let kind = if off == first && r.chance(5) { "Purchase" } else { kind };
+            let l = line(&mut r, &id, &who, &ts, &ingest, kind, &prod, &price);
+            let twice = r.chance(6);
+            if id.len() > 9 {
+                long_bytes += id.len() * (1 + usize::from(twice));
+            }
+            if twice {
+                lines.push(l.clone());
+            }
+            lines.push(l);
+        }
+    }
+    shuffle(&mut r, &mut lines);
+    let mut bodies: Vec<Vec<u8>> = vec![Vec::new(); 5];
+    for l in &lines {
+        let f = r.below(5) as usize;
+        bodies[f].extend_from_slice(l.as_bytes());
+        bodies[f].push(b'\n');
+    }
+    write_parts(&dir.join("events"), "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents", bodies, false);
+
+    let mut clicks = String::new();
+    for k in 0..300u64 {
+        let who = &users[r.below(users.len() as u64) as usize];
+        let t = ws - 3 * DAY_MS + r.below(16 * DAY_MS as u64) as i64;
+        clicks.push_str(&format!("click-with-a-long-name-{k:05},{who},c_{},{t}\n", 1 + r.below(3)));
+        clicks.push_str(&format!("k{k},{who},c_{},{}\n", 1 + r.below(3), t - 1 - r.below(3_600_000) as i64));
+    }
+    write_parts(&dir.join("clicks"), "click_id,user_id,campaign_id,ts", vec![clicks.into_bytes()], false);
+    write_parts(&dir.join("links"), "user_id_a,user_id_b", vec![(links.join("\n") + "\n").into_bytes()], false);
+    long_bytes
+}
+
+/// Equal hash bits at scale. With eight, four or two hash bits left, the
+/// long IDs of `collide_dataset` fall into 256, 16 or 4 classes. Each run
+/// copies megabytes of them, so one thread fills several blocks and the
+/// keys that share their hash bits name copies in different blocks of
+/// different threads. One thread to sixteen, then the dense shape with ID
+/// tables from far too small up. The masks keep bits 40 and up only, and
+/// the IDs stay under the length that is copied. One mask a test, as above.
+fn long_event_ids_collide(m: usize, mask: u64, ids: u64, least: usize) {
+    let _alone = crate::ids::EVENT_MASK_GATE.write().unwrap_or_else(|e| e.into_inner());
+    MASK_IS_MINE.set(true);
+    let _reset = MaskReset;
+    let root = std::env::temp_dir().join(format!("sessions-collide-{m}-{}", std::process::id()));
+    let mut sessions = 0;
+    crate::ids::set_event_hash_mask(mask);
+    let dir = root.join(format!("m{m}"));
+    let long_bytes = collide_dataset(&dir, m as u64, ids, 110);
+    assert!(long_bytes > least, "mask {mask:x}: only {long_bytes} bytes of long IDs");
+    for (threads, chunk, bits) in [(1, 64 << 20, 1), (3, 1 << 16, 2), (16, 4096, 5)] {
+        sessions += compare(&dir, &cfg(threads, chunk, bits))[2];
+    }
+    let lk = load_lookups(&dir);
+    let want = naive::run(&dir, &lk);
+    for slots in [64usize, 1024, 1 << 16] {
+        check_shape(&dir, &dense_cfg(4, 2048, 3, Some(slots)), &lk, &want);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(sessions > 1500, "only {sessions} sessions");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn long_event_ids_collide_on_eight_hash_bits() {
+    long_event_ids_collide(0, 0xFF << 40, 15_000, 2 << 20);
+}
+
+#[test]
+fn long_event_ids_collide_on_four_hash_bits() {
+    long_event_ids_collide(1, 0xF << 59, 10_000, 3 << 19);
+}
+
+#[test]
+fn long_event_ids_collide_on_two_hash_bits() {
+    long_event_ids_collide(2, 0x5 << 47, 5000, 1 << 19);
 }
