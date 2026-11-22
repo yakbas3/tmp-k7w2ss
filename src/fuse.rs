@@ -14,7 +14,12 @@
 //! three commas come from the first 64 bytes, the rest of the line from the
 //! 64 bytes starting at the third comma. A click line fits in 64 bytes.
 //!
-//! The caller must make the 96 bytes from the line start readable.
+//! A line with a long ID does not fit those reads (an ID may be a letter
+//! and 32 hex digits, and a line then up to 145 bytes). `wide_line` reads
+//! such a line from the masks of 192 bytes: the same accept-only contract,
+//! at about twice the work, tried when the narrow reader refuses.
+//!
+//! The caller must make the 192 bytes from the line start readable.
 
 use crate::scan::Bounds;
 
@@ -270,4 +275,143 @@ pub unsafe fn click_line(p: *const u8, out: &mut Bounds, clean: &mut bool) -> u3
         return REFUSED;
     }
     l
+}
+
+/// Bytes `wide_line` reads from the line start.
+pub const WIDE: usize = 192;
+
+/// Masks of 192 bytes as three words each: commas, line breaks, quotes, and
+/// the bytes outside 1..=127.
+struct WideMasks {
+    c: [u64; 3],
+    n: [u64; 3],
+    q: [u64; 3],
+    odd: [u64; 3],
+}
+
+#[inline(always)]
+unsafe fn masks_wide(p: *const u8) -> WideMasks {
+    let mut out = WideMasks { c: [0; 3], n: [0; 3], q: [0; 3], odd: [0; 3] };
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use core::arch::x86_64::*;
+        let comma = _mm256_set1_epi8(b',' as i8);
+        let nl = _mm256_set1_epi8(b'\n' as i8);
+        let quote = _mm256_set1_epi8(b'"' as i8);
+        let zero = _mm256_setzero_si256();
+        for w in 0..3 {
+            let a = _mm256_loadu_si256(p.add(64 * w) as *const __m256i);
+            let b = _mm256_loadu_si256(p.add(64 * w + 32) as *const __m256i);
+            let m = |x: __m256i, y: __m256i, k: __m256i| {
+                u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, k)) as u32)
+                    | (u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(y, k)) as u32) << 32)
+            };
+            out.c[w] = m(a, b, comma);
+            out.n[w] = m(a, b, nl);
+            out.q[w] = m(a, b, quote);
+            // Signed: a byte is in 1..=127 exactly when it is above zero.
+            let plain = u64::from(_mm256_movemask_epi8(_mm256_cmpgt_epi8(a, zero)) as u32)
+                | (u64::from(_mm256_movemask_epi8(_mm256_cmpgt_epi8(b, zero)) as u32) << 32);
+            out.odd[w] = !plain;
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        for i in 0..WIDE {
+            let b = *p.add(i);
+            let (w, bit) = (i / 64, 1u64 << (i % 64));
+            if b == b',' {
+                out.c[w] |= bit;
+            }
+            if b == b'\n' {
+                out.n[w] |= bit;
+            }
+            if b == b'"' {
+                out.q[w] |= bit;
+            }
+            if !(1..=127).contains(&b) {
+                out.odd[w] |= bit;
+            }
+        }
+    }
+    out
+}
+
+/// The bits of a three-word mask below position `n` (at most 191).
+#[inline(always)]
+fn below(m: [u64; 3], n: u32) -> [u64; 3] {
+    let (w, low) = ((n >> 6) as usize, (1u64 << (n & 63)) - 1);
+    let mut out = [0u64; 3];
+    for i in 0..3 {
+        out[i] = if i < w {
+            m[i]
+        } else if i == w {
+            m[i] & low
+        } else {
+            0
+        };
+    }
+    out
+}
+
+#[inline(always)]
+fn ones(m: [u64; 3]) -> u32 {
+    m[0].count_ones() + m[1].count_ones() + m[2].count_ones()
+}
+
+/// The line of `N` fields at `p` whose line break is within 192 bytes: as
+/// `event_line` and `click_line`, for the lines too wide for them. `clean`
+/// is set when the first two fields are all bytes in 1..=127.
+#[inline(never)]
+pub unsafe fn wide_line<const N: usize>(p: *const u8, out: &mut Bounds, clean: &mut bool) -> u32 {
+    let m = masks_wide(p);
+    let nl = if m.n[0] != 0 {
+        tz(m.n[0])
+    } else if m.n[1] != 0 {
+        64 + tz(m.n[1])
+    } else if m.n[2] != 0 {
+        128 + tz(m.n[2])
+    } else {
+        return REFUSED;
+    };
+    let c = below(m.c, nl);
+    let q = below(m.q, nl);
+    if ones(c) != N as u32 - 1 {
+        return REFUSED;
+    }
+    // d[k] ends field k - 1 and d[k + 1] ends field k; d[0] is the line
+    // break before the line.
+    let mut d = [0u32; 9];
+    d[0] = u32::MAX;
+    let mut k = 1;
+    for (w, &word) in c.iter().enumerate() {
+        let mut t = word;
+        while t != 0 {
+            d[k] = 64 * w as u32 + tz(t);
+            k += 1;
+            t = blsr(t);
+        }
+    }
+    d[N] = nl;
+    // A field is quoted when its first and last bytes are quotes (two
+    // different bytes), and then those are the only quotes it may hold: so
+    // every quote of the line must be one of those.
+    let bit = |i: u32| ((q[(i >> 6) as usize] >> (i & 63)) & 1) as u32;
+    let mut quoted = 0;
+    for k in 0..N {
+        let start = d[k].wrapping_add(1);
+        let len = d[k + 1] - start;
+        let (open, close) = if len == 0 { (0, 0) } else { (bit(start), bit(d[k + 1] - 1)) };
+        if open != close || (open == 1 && len < 2) {
+            return REFUSED;
+        }
+        quoted += open;
+        out.s[k] = start + open;
+        out.n[k] = len - 2 * open;
+    }
+    if ones(q) != 2 * quoted {
+        return REFUSED;
+    }
+    *clean = ones(below(m.odd, d[2])) == 0;
+    nl
 }

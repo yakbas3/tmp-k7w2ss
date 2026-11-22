@@ -89,24 +89,6 @@ struct Entry {
 
 const DEAD: u64 = u64::MAX;
 
-/// An event key as a map key: equal when the IDs are equal.
-#[derive(Clone, Copy)]
-struct EventId(u64);
-
-impl PartialEq for EventId {
-    fn eq(&self, other: &Self) -> bool {
-        ids::same_event(self.0, other.0)
-    }
-}
-
-impl Eq for EventId {}
-
-impl std::hash::Hash for EventId {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_u64(ids::event_hash_part(self.0));
-    }
-}
-
 /// What dedup needs of one event copy (one-pass shape): its key, when it
 /// was ingested, and the name of its person record (`NO_RECORD` for an
 /// invalid copy, which has none).
@@ -202,7 +184,7 @@ fn person_part(pkey: u64, shift2: u32) -> usize {
 /// bits the dedup table uses inside a partition.
 #[inline(always)]
 fn event_part(ekey: u64, shift1: u32) -> usize {
-    (ids::event_hash_part(ekey).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift1) as usize
+    (ekey.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift1) as usize
 }
 
 /// Lookup tables derived from the catalogs for the fast paths.
@@ -1181,6 +1163,11 @@ impl Emit {
     }
 }
 
+// With `--cfg ss_hot`: the section of `events`, 4096-byte aligned (see
+// `sys::layout`).
+#[cfg(all(ss_hot, target_arch = "x86_64"))]
+core::arch::global_asm!(".pushsection .text.hot_events,\"ax\",@progbits", ".p2align 12", ".popsection");
+
 const VIEW: u32 = u32::from_le_bytes(*b"view");
 const CART: u32 = u32::from_le_bytes(*b"cart");
 const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -1190,7 +1177,9 @@ impl<'a> ParseState<'a> {
     /// copy goes to `emit` for its person lookup, not to `entries`; 2 is the
     /// dense shape, where it goes to `dense`.
     #[inline(never)]
+    #[cfg_attr(all(ss_hot, target_arch = "x86_64"), link_section = ".text.hot_events")]
     unsafe fn events<const MODE: u8, L: Lines>(&mut self, src: L) -> usize {
+        crate::layout_pad!(sys::layout::EVENTS_PAD);
         let fast = self.fast;
         let (ws, wlen) = (fast.ws, fast.wlen);
         let shift1 = self.shift1;
@@ -1209,7 +1198,7 @@ impl<'a> ParseState<'a> {
             if id_len == 0 {
                 return;
             }
-            let ekey = ids::event_key(base.add(b.start(0)), id_len, known);
+            let ekey = ids::pack_in(base.add(b.start(0)), id_len, known);
             let user_len = b.len(1);
             let ukey = ids::pack_in(base.add(b.start(1)), user_len, known);
             let (ts, ingest) = parse_ts_ingest(base.add(b.start(2)), b.len(2), base.add(b.start(3)), b.len(3), cache);
@@ -1350,7 +1339,7 @@ impl<'a> ParseState<'a> {
                 if f[0].is_empty() {
                     return;
                 }
-                let ekey = ids::event_key_slice(f[0]);
+                let ekey = ids::pack_slice(f[0]);
                 let ukey = ids::pack_slice(f[1]);
                 let ingest = parse_ts_naive(f[3]);
                 let ts = parse_ts_naive(f[2]).unwrap_or(BAD);
@@ -1513,16 +1502,22 @@ impl Lines for Fused<'_> {
             let nl = if N == 7 { fuse::event_line(p, &mut b, &mut known) } else { fuse::click_line(p, &mut b, &mut known) };
             let mut used = nl as usize + 1;
             if nl == fuse::REFUSED {
-                // One call site for `f`, so it is inlined.
-                (used, known) = refused_line::<N>(scan, m, pos, &mut b);
-                if used == 0 {
-                    return pos;
+                // A line too wide for the narrow reader (a long ID) first.
+                let wide = fuse::wide_line::<N>(p, &mut b, &mut known);
+                if wide != fuse::REFUSED {
+                    used = wide as usize + 1;
+                } else {
+                    // One call site for `f`, so it is inlined.
+                    (used, known) = refused_line::<N>(scan, m, pos, &mut b);
+                    if used == 0 {
+                        return pos;
+                    }
+                    if !known {
+                        pos += used;
+                        continue;
+                    }
+                    known = scan.clean;
                 }
-                if !known {
-                    pos += used;
-                    continue;
-                }
-                known = scan.clean;
             }
             f(p, &b, known);
             pos += used;
@@ -1748,7 +1743,7 @@ impl<'a> Resolver<'a> {
                 for k in from..to {
                     let entry = &mut *data.add(k);
                     prefetch(ahead.wrapping_add(k));
-                    let h = mix1(ids::event_hash_part(entry.ekey));
+                    let h = mix1(entry.ekey);
                     // Low hash bits, apart from the home bits (20 and up).
                     let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
                     let me = first | k as u32;
@@ -1762,7 +1757,7 @@ impl<'a> Resolver<'a> {
                         if slot & !pos_mask == tag {
                             let at = slot & pos_mask;
                             let other = (*bases.add((at >> OFF_BITS) as usize)).add((at & OFF_MASK) as usize);
-                            if ids::same_event((*other).ekey, entry.ekey) {
+                            if (*other).ekey == entry.ekey {
                                 // Same event: the smaller ingest stays. On
                                 // a tie the copies are identical.
                                 if entry.ingest < (*other).ingest {
@@ -1956,7 +1951,7 @@ impl<'a> Deduper<'a> {
                     let ahead = note as *const Note as usize + DEDUP_AHEAD;
                     let ahead = if ahead < end || next.is_null() { ahead } else { next as usize + (ahead - end) };
                     prefetch(ahead as *const u8);
-                    let h = mix1(ids::event_hash_part(note.ekey));
+                    let h = mix1(note.ekey);
                     let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
                     let me = first | k as u32;
                     let mut i = (h >> 20) as usize & mask;
@@ -1969,7 +1964,7 @@ impl<'a> Deduper<'a> {
                         if slot & !pos_mask == tag {
                             let at = slot & pos_mask;
                             let other = (*bases.add((at >> NOTE_OFF_BITS) as usize)).add((at & NOTE_OFF_MASK) as usize);
-                            if ids::same_event((*other).ekey, note.ekey) {
+                            if (*other).ekey == note.ekey {
                                 // Same event: the smaller ingest stays.
                                 if note.ingest < (*other).ingest {
                                     self.drop_record((*other).rec);
@@ -1999,7 +1994,7 @@ impl<'a> Deduper<'a> {
         use std::collections::HashMap;
         // Per key: the exact ingest and record of the copy that stays so
         // far, from the table or from this list.
-        let mut best: HashMap<EventId, (i64, u32)> = HashMap::new();
+        let mut best: HashMap<u64, (i64, u32)> = HashMap::new();
         let table = self.table.as_ptr();
         let exact = |ingest: u32| -> i64 {
             if ingest == u32::MAX {
@@ -2009,11 +2004,11 @@ impl<'a> Deduper<'a> {
             }
         };
         for w in wide {
-            let current = match best.get(&EventId(w.ekey)) {
+            let current = match best.get(&w.ekey) {
                 Some(&b) => Some(b),
                 None => {
                     // The winner among the notes, if the key has any.
-                    let h = mix1(ids::event_hash_part(w.ekey));
+                    let h = mix1(w.ekey);
                     let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
                     let mut i = (h >> 20) as usize & mask;
                     let mut found = None;
@@ -2025,7 +2020,7 @@ impl<'a> Deduper<'a> {
                         if slot & !pos_mask == tag {
                             let at = slot & pos_mask;
                             let other = (*self.bases.as_ptr().add((at >> NOTE_OFF_BITS) as usize)).add((at & NOTE_OFF_MASK) as usize);
-                            if ids::same_event((*other).ekey, w.ekey) {
+                            if (*other).ekey == w.ekey {
                                 found = Some((exact((*other).ingest), (*other).rec));
                                 break;
                             }
@@ -2046,7 +2041,7 @@ impl<'a> Deduper<'a> {
                     kept
                 }
             };
-            best.insert(EventId(w.ekey), stays);
+            best.insert(w.ekey, stays);
         }
     }
 }
@@ -4303,6 +4298,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     let click_files: Vec<Mapped> = list_csv(&data.join("clicks")).iter().map(|p| sys::map_file(p)).collect();
     let link_files: Vec<Mapped> = list_csv(&data.join("links")).iter().map(|p| sys::map_file(p)).collect();
     let event_bytes: u64 = event_files.iter().map(|m| m.len as u64).sum();
+    ids::size_for(event_bytes + click_files.iter().chain(&link_files).map(|m| m.len as u64).sum::<u64>());
     let fast = Fast::new(lk, event_bytes)?;
     let fast = &fast;
     let threads = cfg.threads;
@@ -5118,6 +5114,25 @@ mod fused_tests {
             src.run::<N>(|p, bb, k| collect::<N>(p, buf.as_ptr(), bb, k, &mut staged))
         };
         assert_eq!(used, line.len() + 1);
+        // The wide reader on the same line: it may refuse, and what it
+        // accepts it splits as stage 1 and 2 do.
+        let mut wb = Bounds::new();
+        let mut wknown = false;
+        let wnl = unsafe { fuse::wide_line::<N>(buf.as_ptr(), &mut wb, &mut wknown) };
+        if wnl != fuse::REFUSED {
+            assert_eq!(wnl as usize, line.len(), "wide line end of {:?}", String::from_utf8_lossy(line));
+            assert_eq!(staged.len(), 1, "wide accepted a malformed line {:?}", String::from_utf8_lossy(line));
+            for i in 0..N {
+                let f = &buf[wb.start(i)..wb.start(i) + wb.len(i)];
+                assert_eq!(f, &staged[0].1[i][..], "wide field {i} of {:?}", String::from_utf8_lossy(line));
+                if wknown && i < 2 {
+                    assert!(f.iter().all(|&c| (1..=127).contains(&c)), "wide known but not plain");
+                }
+            }
+        } else {
+            // It takes every well-formed line that ends within its reach.
+            assert!(staged.is_empty() || line.len() >= fuse::WIDE, "wide refused {:?}", String::from_utf8_lossy(line));
+        }
         if nl == fuse::REFUSED {
             return false;
         }
@@ -5190,7 +5205,7 @@ mod fused_tests {
         quotes::<4>(&CLICK);
     }
 
-    /// Lines of every length from 20 to 150 bytes, padded or cut in each
+    /// Lines of every length from 20 to 230 bytes, padded or cut in each
     /// field in turn, plain and quoted: commas and line breaks on every side
     /// of the 32, 64, 96 and 128 byte edges.
     fn lengths<const N: usize>(base: &[&str]) {
@@ -5199,7 +5214,7 @@ mod fused_tests {
         let mut accepted = 0;
         for k in 0..N {
             for quoted in [false, true] {
-                for total in 20..=150usize {
+                for total in 20..=230usize {
                     let mut f = fields.clone();
                     if quoted {
                         f[k] = [&b"\""[..], &f[k], b"\""].concat();
@@ -5224,7 +5239,7 @@ mod fused_tests {
                 }
             }
         }
-        eprintln!("{N} fields: {accepted} of {} lengths by the fast path", N * 2 * 131);
+        eprintln!("{N} fields: {accepted} of {} lengths by the fast path", N * 2 * 211);
         assert!(accepted > N * 2 * 131 / 4);
         check::<N>(&text, "lengths");
     }
@@ -5257,6 +5272,8 @@ mod fused_tests {
                         0 => 0,
                         1 => 1,
                         2 => 20 + rng(&mut state) % 60,
+                        3 | 4 if i < 2 => 33,
+                        5 if round % 7 == 0 => 60 + rng(&mut state) % 90,
                         _ => 3 + rng(&mut state) % 20,
                     };
                     let quoting = rng(&mut state) % 100;
