@@ -1,0 +1,27 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sessions"
+path = "src/main.rs"
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+
+[profile.test]
+opt-level = 2
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false

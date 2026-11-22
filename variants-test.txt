@@ -1,0 +1,15 @@
+# Local test table: a few real variants plus three broken ones that must be
+# reported, not hidden. Use with -e BENCH_TABLE=/bench/variants-test.txt.
+
+build a          a
+build t          t
+build b3         b3
+
+first A
+scatter A 3
+run A           a
+run Acold       a cold=1
+run B3          b3
+run crash       @self BENCH_FAKE=crash
+run wrong       @self BENCH_FAKE=wrong
+run missing     /bench/bin/does-not-exist
