@@ -5090,6 +5090,26 @@ mod fused_tests {
         }
     }
 
+    /// Whether `wide_line` must take this line when it is well formed: the
+    /// line break in 64..`fuse::WIDE`, field 0 in 1..=62 bytes, fields 1
+    /// and 2 (3 and 4, 5 and 6) at most 63 bytes together, a last field
+    /// alone at most 64 (raw bytes, quotes included).
+    fn wide_reach<const N: usize>(line: &[u8]) -> bool {
+        let f: Vec<usize> = line.split(|&c| c == b',').map(|x| x.len()).collect();
+        if f.len() != N || line.len() < 64 || line.len() >= fuse::WIDE || f[0] == 0 || f[0] > 62 {
+            return false;
+        }
+        let mut k = 1;
+        while k < N {
+            let two = if k + 1 < N { f[k] + f[k + 1] + 1 } else { f[k] };
+            if two > 64 {
+                return false;
+            }
+            k += 2;
+        }
+        true
+    }
+
     /// One line, followed by `next`: the one-pass verdict and bounds
     /// against stage 1 and 2 on a window holding just that line.
     fn line<const N: usize>(line: &[u8], next: &[u8]) -> bool {
@@ -5130,8 +5150,9 @@ mod fused_tests {
                 }
             }
         } else {
-            // It takes every well-formed line that ends within its reach.
-            assert!(staged.is_empty() || line.len() >= fuse::WIDE, "wide refused {:?}", String::from_utf8_lossy(line));
+            // It takes every well-formed line that ends within its reach and
+            // whose fields fit its windows.
+            assert!(staged.is_empty() || !wide_reach::<N>(line), "wide refused {:?}", String::from_utf8_lossy(line));
         }
         if nl == fuse::REFUSED {
             return false;
@@ -5242,6 +5263,54 @@ mod fused_tests {
         eprintln!("{N} fields: {accepted} of {} lengths by the fast path", N * 2 * 211);
         assert!(accepted > N * 2 * 131 / 4);
         check::<N>(&text, "lengths");
+    }
+
+    /// Two neighbouring fields of many lengths together, plain and quoted:
+    /// the delimiters of the wide reader's windows fall on every side of
+    /// the window ends (63 and 64 bytes past the delimiter before).
+    fn pairs<const N: usize>(base: &[&str]) {
+        let fields: Vec<Vec<u8>> = base.iter().map(|f| f.as_bytes().to_vec()).collect();
+        let make = |l: usize, quoted: bool| {
+            if quoted && l >= 2 {
+                [&b"\""[..], &vec![b'7'; l - 2], b"\""].concat()
+            } else {
+                vec![b'7'; l]
+            }
+        };
+        let mut text = Vec::new();
+        let mut wide = 0;
+        for k in 0..N - 1 {
+            for la in 0..=70usize {
+                let mut lbs = vec![0usize, 1, 2, 20, 27, 35];
+                lbs.extend((60usize..=66).filter_map(|t| t.checked_sub(la)));
+                for &lb in &lbs {
+                    for (qa, qb) in [(false, false), (true, false), (false, true), (true, true)] {
+                        let mut f = fields.clone();
+                        f[k] = make(la, qa);
+                        f[k + 1] = make(lb, qb);
+                        // Long enough for the wide reader.
+                        let pad = if k + 2 < N { N - 1 } else { 0 };
+                        if join(&f).len() < 64 {
+                            let need = 64 - join(&f).len();
+                            f[pad].extend(std::iter::repeat_n(b'7', need));
+                        }
+                        let l = join(&f);
+                        line::<N>(&l, &join(&fields));
+                        wide += usize::from(wide_reach::<N>(&l));
+                        text.extend_from_slice(&l);
+                        text.push(b'\n');
+                    }
+                }
+            }
+        }
+        eprintln!("{N} fields: {wide} pair lines in the wide reader's reach");
+        check::<N>(&text, "pairs");
+    }
+
+    #[test]
+    fn field_pairs_around_window_ends() {
+        pairs::<7>(&EVENT);
+        pairs::<4>(&CLICK);
     }
 
     #[test]

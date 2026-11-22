@@ -16,8 +16,9 @@
 //!
 //! A line with a long ID does not fit those reads (an ID may be a letter
 //! and 32 hex digits, and a line then up to 145 bytes). `wide_line` reads
-//! such a line from the masks of 192 bytes: the same accept-only contract,
-//! at about twice the work, tried when the narrow reader refuses.
+//! such a line from the masks of 160 bytes and the bytes around its
+//! delimiters: the same accept-only contract, tried when the narrow reader
+//! refuses.
 //!
 //! The caller must make the 192 bytes from the line start readable.
 
@@ -277,141 +278,269 @@ pub unsafe fn click_line(p: *const u8, out: &mut Bounds, clean: &mut bool) -> u3
     l
 }
 
-/// Bytes `wide_line` reads from the line start.
-pub const WIDE: usize = 192;
+/// Bytes `wide_line` takes masks of. A line whose line break is not below
+/// this is refused. Its byte reads end at most 3 bytes past the line break,
+/// so it reads at most `WIDE + 2` bytes from the line start.
+pub const WIDE: usize = 160;
 
-/// Masks of 192 bytes as three words each: commas, line breaks, quotes, and
-/// the bytes outside 1..=127.
+/// Masks of the first 160 bytes: delimiters (commas and line breaks) as
+/// three words and two zero words after them, quotes of the first 128
+/// bytes as two words, and whether all 160 bytes are in 1..=127.
 struct WideMasks {
-    c: [u64; 3],
-    n: [u64; 3],
-    q: [u64; 3],
-    odd: [u64; 3],
+    d: [u64; 5],
+    q: [u64; 2],
+    clean: bool,
 }
 
 #[inline(always)]
 unsafe fn masks_wide(p: *const u8) -> WideMasks {
-    let mut out = WideMasks { c: [0; 3], n: [0; 3], q: [0; 3], odd: [0; 3] };
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         use core::arch::x86_64::*;
-        let comma = _mm256_set1_epi8(b',' as i8);
-        let nl = _mm256_set1_epi8(b'\n' as i8);
+        // A byte is a delimiter when it equals the table entry of its low
+        // nibble: ',' at 0xC, '\n' at 0xA, 0xFF (no byte below 0x80) at the
+        // rest. A byte from 0x80 up looks up 0 and is not 0.
+        let table = _mm256_setr_epi8(
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, b'\n' as i8, -1, b',' as i8, -1, -1, -1, //
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, b'\n' as i8, -1, b',' as i8, -1, -1, -1,
+        );
         let quote = _mm256_set1_epi8(b'"' as i8);
-        let zero = _mm256_setzero_si256();
-        for w in 0..3 {
-            let a = _mm256_loadu_si256(p.add(64 * w) as *const __m256i);
-            let b = _mm256_loadu_si256(p.add(64 * w + 32) as *const __m256i);
-            let m = |x: __m256i, y: __m256i, k: __m256i| {
-                u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, k)) as u32)
-                    | (u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(y, k)) as u32) << 32)
-            };
-            out.c[w] = m(a, b, comma);
-            out.n[w] = m(a, b, nl);
-            out.q[w] = m(a, b, quote);
-            // Signed: a byte is in 1..=127 exactly when it is above zero.
-            let plain = u64::from(_mm256_movemask_epi8(_mm256_cmpgt_epi8(a, zero)) as u32)
-                | (u64::from(_mm256_movemask_epi8(_mm256_cmpgt_epi8(b, zero)) as u32) << 32);
-            out.odd[w] = !plain;
+        let ld = |i: usize| _mm256_loadu_si256(p.add(32 * i) as *const __m256i);
+        let x = [ld(0), ld(1), ld(2), ld(3), ld(4)];
+        let d = |x: __m256i| u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_shuffle_epi8(table, x), x)) as u32);
+        let q = |x: __m256i| u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, quote)) as u32);
+        // Signed: a byte is in 1..=127 exactly when it is above zero.
+        let low = _mm256_min_epi8(_mm256_min_epi8(_mm256_min_epi8(x[0], x[1]), _mm256_min_epi8(x[2], x[3])), x[4]);
+        WideMasks {
+            d: [d(x[0]) | (d(x[1]) << 32), d(x[2]) | (d(x[3]) << 32), d(x[4]), 0, 0],
+            q: [q(x[0]) | (q(x[1]) << 32), q(x[2]) | (q(x[3]) << 32)],
+            clean: _mm256_movemask_epi8(_mm256_cmpgt_epi8(low, _mm256_setzero_si256())) == -1,
         }
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     {
+        let mut out = WideMasks { d: [0; 5], q: [0; 2], clean: true };
         for i in 0..WIDE {
             let b = *p.add(i);
             let (w, bit) = (i / 64, 1u64 << (i % 64));
-            if b == b',' {
-                out.c[w] |= bit;
+            if b == b',' || b == b'\n' {
+                out.d[w] |= bit;
             }
-            if b == b'\n' {
-                out.n[w] |= bit;
-            }
-            if b == b'"' {
+            if i < 128 && b == b'"' {
                 out.q[w] |= bit;
             }
             if !(1..=127).contains(&b) {
-                out.odd[w] |= bit;
+                out.clean = false;
             }
         }
+        out
     }
-    out
 }
 
-/// The bits of a three-word mask below position `n` (at most 191).
+/// The quotes of the 32 bytes from `p + 128`.
 #[inline(always)]
-fn below(m: [u64; 3], n: u32) -> [u64; 3] {
-    let (w, low) = ((n >> 6) as usize, (1u64 << (n & 63)) - 1);
-    let mut out = [0u64; 3];
-    for i in 0..3 {
-        out[i] = if i < w {
-            m[i]
-        } else if i == w {
-            m[i] & low
+unsafe fn quotes_tail(p: *const u8) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use core::arch::x86_64::*;
+        let x = _mm256_loadu_si256(p.add(128) as *const __m256i);
+        u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, _mm256_set1_epi8(b'"' as i8))) as u32)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let mut q = 0;
+        for i in 0..32 {
+            q |= u64::from(*p.add(128 + i) == b'"') << i;
+        }
+        q
+    }
+}
+
+/// Whether `wide_line` reads the bytes around the delimiters with one
+/// plain loads (the default) or with one gather (`--cfg ss_gather`, for CPUs
+/// whose gather is slowed by a microcode mitigation).
+#[allow(dead_code)]
+const GATHER: bool = cfg!(ss_gather);
+
+/// What `wide_line` expects around delimiter `k` (lane `k`, four bytes
+/// from the byte before it): a quote, a comma (a line break for the last
+/// delimiter and the lanes after it), a quote, and any byte.
+struct Pattern<const N: usize>;
+
+impl<const N: usize> Pattern<N> {
+    const BYTES: [u8; 32] = {
+        let mut out = [0u8; 32];
+        let mut k = 0;
+        while k < 8 {
+            out[4 * k] = b'"';
+            out[4 * k + 1] = if k + 1 < N { b',' } else { b'\n' };
+            out[4 * k + 2] = b'"';
+            k += 1;
+        }
+        out
+    };
+}
+
+/// The delimiters of a line in eight lanes: `e[k]` for `k < N`, then
+/// zeros.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+type Lanes = core::arch::x86_64::__m256i;
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+type Lanes = [u32; 8];
+
+#[inline(always)]
+unsafe fn lanes<const N: usize>(e: &[u32; 8]) -> Lanes {
+    let at = |k: usize| if k < N { e[k] } else { 0 };
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    {
+        use core::arch::x86_64::*;
+        let a = |k: usize| at(k) as i32;
+        _mm256_setr_epi32(a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+    {
+        [at(0), at(1), at(2), at(3), at(4), at(5), at(6), at(7)]
+    }
+}
+
+/// The bytes around the delimiters `v` against `Pattern<N>`: bit `4k + j`
+/// (for `k < N`) is set when byte `v[k] - 1 + j` matches. Each delimiter
+/// must be in 1..160, so the reads are within `p[0..162]`. Lanes from `N`
+/// on are not read. Also returns lane `k` as 1 when byte `v[k] - 1` (the
+/// last of field `k`) is a quote, else 0.
+#[inline(always)]
+unsafe fn around<const N: usize>(p: *const u8, v: Lanes, e: &[u32; 8]) -> (u32, Lanes) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    {
+        use core::arch::x86_64::*;
+        let g = if GATHER {
+            let live = _mm256_cmpgt_epi32(_mm256_set1_epi32(N as i32), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+            _mm256_mask_i32gather_epi32::<1>(_mm256_setzero_si256(), p.wrapping_sub(1) as *const i32, v, live)
         } else {
-            0
+            // The same four bytes per lane by plain loads.
+            let _ = v;
+            let at = |k: usize| if k < N { (p.add(e[k] as usize - 1) as *const i32).read_unaligned() } else { 0 };
+            _mm256_setr_epi32(at(0), at(1), at(2), at(3), at(4), at(5), at(6), at(7))
         };
+        let pat = _mm256_loadu_si256(Pattern::<N>::BYTES.as_ptr() as *const __m256i);
+        let hit = _mm256_cmpeq_epi8(g, pat);
+        (_mm256_movemask_epi8(hit) as u32, _mm256_and_si256(hit, _mm256_set1_epi32(1)))
     }
-    out
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+    {
+        let _ = e;
+        let mut hits = 0u32;
+        for k in 0..N {
+            for j in 0..4 {
+                if *p.add(v[k] as usize - 1 + j) == Pattern::<N>::BYTES[4 * k + j] {
+                    hits |= 1 << (4 * k + j);
+                }
+            }
+        }
+        let mut q = [0u32; 8];
+        for (k, q) in q.iter_mut().enumerate() {
+            *q = (hits >> (4 * k)) & 1;
+        }
+        (hits, q)
+    }
 }
 
+/// `bounds` for the delimiters in lanes: field `k` from after `v[k - 1]`
+/// (-1 for `k` = 0) to `v[k]`, quotes stripped when lane `k` of `q` is 1.
+/// Returns the fields of the first `N` that end before they start.
 #[inline(always)]
-fn ones(m: [u64; 3]) -> u32 {
-    m[0].count_ones() + m[1].count_ones() + m[2].count_ones()
+unsafe fn lane_bounds<const N: usize>(v: Lanes, q: Lanes, out: &mut Bounds) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    {
+        use core::arch::x86_64::*;
+        let ones = _mm256_set1_epi32(-1);
+        let prev = _mm256_blend_epi32::<1>(_mm256_permutevar8x32_epi32(v, _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6)), ones);
+        let start = _mm256_sub_epi32(_mm256_add_epi32(prev, q), ones);
+        let len = _mm256_sub_epi32(_mm256_sub_epi32(v, start), q);
+        _mm256_store_si256(out.s.as_mut_ptr() as *mut __m256i, start);
+        _mm256_store_si256(out.n.as_mut_ptr() as *mut __m256i, len);
+        _mm256_movemask_ps(_mm256_castsi256_ps(len)) as u32 & ((1 << N) - 1)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+    {
+        let quoted = (0..8).fold(0u64, |a, k| a | (u64::from(q[k]) << k));
+        bounds::<N>([u32::MAX, v[0], v[1], v[2]], [v[3], v[4], v[5], v[6]], 0, quoted, out)
+    }
 }
 
-/// The line of `N` fields at `p` whose line break is within 192 bytes: as
-/// `event_line` and `click_line`, for the lines too wide for them. `clean`
-/// is set when the first two fields are all bytes in 1..=127.
+/// The line of `N` fields (7 or 4) at `p` whose line break is below byte
+/// 160: as `event_line` and `click_line`, for the lines too wide for them.
+/// `clean` is set when the 160 bytes from `p` are all in 1..=127 (so both ID
+/// fields are).
+///
+/// The delimiters come from 64-bit windows of the delimiter mask, each
+/// starting right after a delimiter found so far: field 0 from the first
+/// word, then fields 1 and 2, 3 and 4, 5 and 6 two at a time. So it also
+/// refuses a line whose field 0 is empty or longer than 62 bytes, or whose
+/// fields 1 and 2 (3 and 4, 5 and 6) are together longer than 63 bytes
+/// (for 4 fields: field 3 longer than 64). Generated lines have at most
+/// 35 + 27 there.
 #[inline(never)]
 pub unsafe fn wide_line<const N: usize>(p: *const u8, out: &mut Bounds, clean: &mut bool) -> u32 {
     let m = masks_wide(p);
-    let nl = if m.n[0] != 0 {
-        tz(m.n[0])
-    } else if m.n[1] != 0 {
-        64 + tz(m.n[1])
-    } else if m.n[2] != 0 {
-        128 + tz(m.n[2])
-    } else {
-        return REFUSED;
-    };
-    let c = below(m.c, nl);
-    let q = below(m.q, nl);
-    if ones(c) != N as u32 - 1 {
-        return REFUSED;
-    }
-    // d[k] ends field k - 1 and d[k + 1] ends field k; d[0] is the line
-    // break before the line.
-    let mut d = [0u32; 9];
-    d[0] = u32::MAX;
+    // e[k] ends field k: the commas, then the line break e[N - 1]. Each
+    // window holds the 64 bits from `x`, right after delimiter k - 1, and
+    // gives the next two delimiters, or x + 64 for one it does not hold.
+    // Such a guess is kept only when the byte there is a delimiter (checked
+    // below), and then it is the next one, as the window held none. A
+    // window without any gives the same guess twice, and `lane_bounds`
+    // flags the field between them, of length -1.
+    let mut e = [0u32; 8];
+    e[0] = tz(m.d[0]);
     let mut k = 1;
-    for (w, &word) in c.iter().enumerate() {
-        let mut t = word;
-        while t != 0 {
-            d[k] = 64 * w as u32 + tz(t);
-            k += 1;
-            t = blsr(t);
-        }
+    while k < N {
+        let x = e[k - 1] + 1;
+        let w = if k == 1 {
+            // x is in 2..=63 once e[0] is checked below.
+            (((u128::from(m.d[1]) << 64) | u128::from(m.d[0])) >> (x & 63)) as u64
+        } else {
+            // Bound: e[0] <= 64 and each window adds at most 65, so x <=
+            // 195 for the third window, x >> 6 <= 3, and the words read are
+            // at most d[3] and d[4] (both zero).
+            let i = (x >> 6) as usize & 3;
+            (((u128::from(m.d[i + 1]) << 64) | u128::from(m.d[i])) >> (x & 63)) as u64
+        };
+        e[k] = x + tz(w);
+        e[k + 1] = x + tz(blsr(w));
+        k += 2;
     }
-    d[N] = nl;
-    // A field is quoted when its first and last bytes are quotes (two
-    // different bytes), and then those are the only quotes it may hold: so
-    // every quote of the line must be one of those.
-    let bit = |i: u32| ((q[(i >> 6) as usize] >> (i & 63)) & 1) as u32;
-    let mut quoted = 0;
-    for k in 0..N {
-        let start = d[k].wrapping_add(1);
-        let len = d[k + 1] - start;
-        let (open, close) = if len == 0 { (0, 0) } else { (bit(start), bit(d[k + 1] - 1)) };
-        if open != close || (open == 1 && len < 2) {
-            return REFUSED;
-        }
-        quoted += open;
-        out.s[k] = start + open;
-        out.n[k] = len - 2 * open;
-    }
-    if ones(q) != 2 * quoted {
+    let nl = e[N - 1];
+    // Field 0 is 1 to 62 bytes (not empty, so the reads below start at p),
+    // and the line break is in 64..160 (the narrow readers take every
+    // well-formed line shorter than 64 bytes). The delimiters do not fall (each
+    // window starts after the last), so all of e[0..N] are in 1..160.
+    if (e[0].wrapping_sub(1) >= 62) | (nl.wrapping_sub(64) >= WIDE as u32 - 64) {
         return REFUSED;
     }
-    *clean = ones(below(m.odd, d[2])) == 0;
+    let v = lanes::<N>(&e);
+    let (hits, quoted) = around::<N>(p, v, &e);
+    let live = (1u32 << (4 * N)) - 1;
+    // The first N - 1 delimiters are commas and the next a line break.
+    let delims = 0x2222_2222 & live;
+    let mut bad = (hits & delims) ^ delims;
+    // Quotes at the first and last byte of each field, at bit 4k for field
+    // k. Lane k holds the last byte of field k (bit 4k) and the first of
+    // field k + 1 (bit 4k + 2). An empty field has its delimiters there,
+    // no quotes.
+    let close = hits & 0x1111_1111 & live;
+    let open = (u32::from(*p == b'"') | ((hits << 2) & 0x1111_1110)) & live;
+    bad |= open ^ close;
+    // Every quote below the line break is one of those (a field that is
+    // one lone quote counts twice here, and `bounds` flags it).
+    let mut quotes = m.q[0].count_ones() + bzhi(m.q[1], nl - 64).count_ones();
+    if nl > 128 {
+        quotes += bzhi(quotes_tail(p), nl - 128).count_ones();
+    }
+    bad |= quotes ^ (2 * close.count_ones());
+    let lone = lane_bounds::<N>(v, quoted, out);
+    *clean = m.clean;
+    if (bad | lone) != 0 {
+        return REFUSED;
+    }
     nl
 }

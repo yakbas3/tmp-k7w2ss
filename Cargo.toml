@@ -11,7 +11,7 @@ path = "src/main.rs"
 libc = { version = "0.2", default-features = false }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ss_hot)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ss_hot)", "cfg(ss_gather)"] }
 
 [profile.release]
 opt-level = 3

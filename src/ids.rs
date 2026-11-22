@@ -161,7 +161,8 @@ struct Slot {
 
 struct HexTable {
     slots: *const Slot,
-    bits: u32,
+    /// Slot count, any value from 1 to `MAX_SLOTS`.
+    n: usize,
 }
 
 impl HexTable {
@@ -170,10 +171,12 @@ impl HexTable {
     /// true from then on.
     #[inline(always)]
     unsafe fn slot_of(&self, hi: u64, lo: u64) -> Option<u32> {
-        let mask = (1usize << self.bits) - 1;
-        let h = (hi ^ lo.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let h = (h ^ (h >> 32)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-        let mut i = (h >> (64 - self.bits)) as usize;
+        // One wide multiply mixes both halves into all 64 bits; the range
+        // reduction then takes the top bits of that. `lo` is at least 2, so
+        // the product is 0 only for the one `hi` equal to the constant.
+        let h = fold(hi ^ 0x2545_F491_4F6C_DD1D, lo);
+        // Range reduction: i < n for any h, with no power of two needed.
+        let mut i = ((u128::from(h) * self.n as u128) >> 64) as usize;
         for _ in 0..PROBES {
             let s = &*self.slots.add(i);
             let mut cur = s.lo.load(Acquire);
@@ -197,7 +200,10 @@ impl HexTable {
             if cur == lo && s.hi.load(Relaxed) == hi {
                 return Some(i as u32);
             }
-            i = (i + 1) & mask;
+            i += 1;
+            if i == self.n {
+                i = 0;
+            }
         }
         None
     }
@@ -205,38 +211,58 @@ impl HexTable {
     #[inline(always)]
     unsafe fn value(&self, slot: u32) -> (u64, u64) {
         let s = &*self.slots.add(slot as usize);
-        (s.hi.load(Relaxed), s.lo.load(Acquire))
+        let lo = s.lo.load(Acquire);
+        (s.hi.load(Relaxed), lo)
     }
 }
 
-/// The global table: its address with log2 of its slot count in the low
-/// bits (mappings are page aligned), 0 until the first long hex ID.
-static TABLE: AtomicUsize = AtomicUsize::new(0);
-/// log2 of the slots to map; fixed once the table exists.
-static WANT_BITS: AtomicUsize = AtomicUsize::new(16);
+/// The global table as one word, so the address and the slot count are
+/// published together: the slot count over the page number of the mapping.
+/// 0 until the first long hex ID.
+static TABLE: AtomicU64 = AtomicU64::new(0);
+/// Slots to map; fixed once the table exists.
+static WANT_SLOTS: AtomicUsize = AtomicUsize::new(1 << 16);
+/// Page numbers below 2^36 cover addresses below 2^48 (every user space
+/// address on x86-64 and arm64); that leaves 28 bits for the slot count.
+const PAGE_BITS: u32 = 36;
+const MAX_SLOTS: usize = (1 << (64 - PAGE_BITS)) - 1;
 
-/// Size the table for an input of this many bytes: about a slot per 128
-/// input bytes, several times the long IDs generated data holds. Too small
-/// a table is slower, never wrong. No effect once the table exists.
+/// Input bytes per table slot. 190 leaves several slots per long ID that
+/// generated data holds; a larger value (2048 once only user IDs use the
+/// table) gives a smaller table. Too small a table is slower, never wrong.
+const BYTES_PER_SLOT: u64 = 190;
+
+/// Slots for an input of this many bytes: any count, not only powers of two.
+fn slots_for(input_bytes: u64, bytes_per_slot: u64) -> usize {
+    (input_bytes / bytes_per_slot).clamp(1 << 12, MAX_SLOTS as u64) as usize
+}
+
+/// Size the table for an input of this many bytes. No effect once the
+/// table exists.
 pub fn size_for(input_bytes: u64) {
-    let slots = (input_bytes / 128).next_power_of_two().clamp(1 << 12, 1 << 30);
-    WANT_BITS.store(slots.trailing_zeros() as usize, Relaxed);
+    WANT_SLOTS.store(slots_for(input_bytes, BYTES_PER_SLOT), Relaxed);
 }
 
 #[inline(always)]
 fn table() -> HexTable {
     let t = TABLE.load(Acquire);
-    let t = if t != 0 { t } else { table_init() };
-    HexTable { slots: (t & !63) as *const Slot, bits: (t & 63) as u32 }
+    decode(if t != 0 { t } else { table_init() })
+}
+
+#[inline(always)]
+fn decode(t: u64) -> HexTable {
+    HexTable { slots: ((t << (64 - PAGE_BITS)) >> (52 - PAGE_BITS)) as *const Slot, n: (t >> PAGE_BITS) as usize }
 }
 
 #[cold]
 #[inline(never)]
-fn table_init() -> usize {
-    let bits = WANT_BITS.load(Relaxed);
+fn table_init() -> u64 {
+    let n = WANT_SLOTS.load(Relaxed).clamp(1, MAX_SLOTS);
     // Fresh anonymous memory is zero: every slot EMPTY. A thread that loses
     // the race leaves its mapping untouched, which costs nothing.
-    let fresh = crate::sys::anon(std::mem::size_of::<Slot>() << bits) as usize | bits;
+    let addr = crate::sys::anon(std::mem::size_of::<Slot>() * n) as u64;
+    assert!(addr & 4095 == 0 && addr >> 12 < 1 << PAGE_BITS, "table address {addr:#x}");
+    let fresh = (n as u64) << PAGE_BITS | addr >> 12;
     match TABLE.compare_exchange(0, fresh, AcqRel, Acquire) {
         Ok(_) => fresh,
         Err(now) => now,
@@ -262,20 +288,57 @@ fn hex8(x: u64) -> (u64, u64) {
     ((n | (n >> 16)) & 0xFFFF_FFFF, bad)
 }
 
+/// The 128-bit value of the 32 bytes at `p`, or `None` if one of them is
+/// not a lowercase hex digit. Portable path: four SWAR words.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn hex_value(p: *const u8) -> Option<(u64, u64)> {
+    let word = |at: usize| u64::from_le((p.add(at) as *const u64).read_unaligned());
+    let (a, ba) = hex8(word(0));
+    let (b, bb) = hex8(word(8));
+    let (c, bc) = hex8(word(16));
+    let (d, bd) = hex8(word(24));
+    if (ba | bb | bc | bd) != 0 {
+        return None;
+    }
+    Some(((a << 32) | b, (c << 32) | d))
+}
+
+/// `hex_value` on AVX2: one 32-byte load, a range test per byte, and the
+/// nibbles joined by a multiply-add and a pack.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn hex_value(p: *const u8) -> Option<(u64, u64)> {
+    use core::arch::x86_64::*;
+    let v = _mm256_loadu_si256(p as *const __m256i);
+    // Unsigned: a byte is a digit if c - '0' <= 9, a letter if c - 'a' <= 5.
+    let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+    let a = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+    let is_digit = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+    let is_alpha = _mm256_cmpeq_epi8(_mm256_min_epu8(a, _mm256_set1_epi8(5)), a);
+    if _mm256_movemask_epi8(_mm256_or_si256(is_digit, is_alpha)) != -1 {
+        return None;
+    }
+    let nib = _mm256_blendv_epi8(_mm256_add_epi8(a, _mm256_set1_epi8(10)), d, is_digit);
+    // Each pair of nibbles, first one high, into one byte of a 16-bit word.
+    let pairs = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+    // Bytes 0 to 7 of each lane hold that lane's 8 values in order.
+    let bytes = _mm256_packus_epi16(pairs, pairs);
+    let joined = _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(bytes));
+    let first = _mm_cvtsi128_si64(joined) as u64;
+    let second = _mm_extract_epi64::<1>(joined) as u64;
+    Some((first.swap_bytes(), second.swap_bytes()))
+}
+
 /// The key of a long hex ID at `p` (33 readable bytes), or `None` if it is
 /// not one or has no slot.
 #[inline(always)]
-unsafe fn hex_key(p: *const u8) -> Option<u64> {
-    let word = |at: usize| u64::from_le((p.add(at) as *const u64).read_unaligned());
-    let (a, ba) = hex8(word(1));
-    let (b, bb) = hex8(word(9));
-    let (c, bc) = hex8(word(17));
-    let (d, bd) = hex8(word(25));
-    let (hi, lo) = ((a << 32) | b, (c << 32) | d);
-    if (ba | bb | bc | bd) != 0 || lo <= BUSY {
+unsafe fn hex_key(p: *const u8, table: HexTable) -> Option<u64> {
+    let (hi, lo) = hex_value(p.add(1))?;
+    if lo <= BUSY {
         return None;
     }
-    let slot = table().slot_of(hi, lo)?;
+    let slot = table.slot_of(hi, lo)?;
     Some(FALLBACK | HEX | (u64::from(*p) << 32) | u64::from(slot))
 }
 
@@ -283,11 +346,25 @@ unsafe fn hex_key(p: *const u8) -> Option<u64> {
 #[inline(never)]
 unsafe fn long(p: *const u8, len: usize) -> u64 {
     if len == HEX_LEN {
-        if let Some(key) = hex_key(p) {
+        // Every call out of here is a tail call, so the hot path keeps
+        // its values in scratch registers and saves none.
+        let t = TABLE.load(Acquire);
+        if t == 0 {
+            return long_first(p, len);
+        }
+        if let Some(key) = hex_key(p, decode(t)) {
             return key;
         }
     }
     intern(std::slice::from_raw_parts(p, len))
+}
+
+/// `long` for the first long hex ID of the run: map the table, then go on.
+#[cold]
+#[inline(never)]
+unsafe fn long_first(p: *const u8, len: usize) -> u64 {
+    table_init();
+    long(p, len)
 }
 
 /// The 33 bytes of a long hex key.
@@ -440,6 +517,14 @@ pub fn unpack(key: u64, out: &mut Vec<u8>) {
 
 #[inline(never)]
 fn cmp_slow(a: u64, b: u64) -> Ordering {
+    const BOTH: u64 = FALLBACK | HEX;
+    if a & b & BOTH == BOTH {
+        // Two hex IDs: same length, and 32 hex digits in a fixed width sort
+        // as their value, so (first byte, hi, lo) is the byte-wise order.
+        let t = table();
+        let (x, y) = unsafe { (t.value(a as u32), t.value(b as u32)) };
+        return ((a >> 32) as u8, x.0, x.1).cmp(&((b >> 32) as u8, y.0, y.1));
+    }
     let (mut x, mut y) = ([0u8; HEX_LEN], [0u8; HEX_LEN]);
     key_bytes(a, &mut x).cmp(key_bytes(b, &mut y))
 }
@@ -555,6 +640,33 @@ mod tests {
     }
 
     #[test]
+    fn hex_value_agrees_with_a_table() {
+        let mut state = 13;
+        let pool = b"0123456789abcdefABCDEFg`/:@G \x00\x7f\x80\xff\xe6";
+        for round in 0..200_000 {
+            let mut bytes = [0u8; 32];
+            for b in &mut bytes {
+                *b = b"0123456789abcdef"[(rng(&mut state) % 16) as usize];
+            }
+            match round % 4 {
+                0 => {}
+                1 => bytes[(rng(&mut state) % 32) as usize] = pool[(rng(&mut state) % pool.len() as u64) as usize],
+                2 => bytes[(rng(&mut state) % 32) as usize] = (rng(&mut state) % 256) as u8,
+                _ => {
+                    for b in &mut bytes {
+                        *b = pool[(rng(&mut state) % pool.len() as u64) as usize];
+                    }
+                }
+            }
+            let want = std::str::from_utf8(&bytes)
+                .ok()
+                .filter(|s| s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+                .map(|s| (u64::from_str_radix(&s[..16], 16).unwrap(), u64::from_str_radix(&s[16..], 16).unwrap()));
+            assert_eq!(unsafe { hex_value(bytes.as_ptr()) }, want, "{bytes:?}");
+        }
+    }
+
+    #[test]
     fn long_hex_ids_round_trip_and_order() {
         let mut state = 5;
         let mut ids: Vec<Vec<u8>> = Vec::new();
@@ -618,8 +730,18 @@ mod tests {
     /// up and most values are refused (the engine then interns them).
     #[test]
     fn hex_table_gives_one_slot_a_value_from_any_thread() {
-        for (bits, values) in [(14u32, 6_000u64), (6, 2_000), (5, 40)] {
-            let slots: Vec<Slot> = (0..1usize << bits).map(|_| Slot { lo: AtomicU64::new(0), hi: AtomicU64::new(0) }).collect();
+        // Roomy, then sizes that are no power of two, small enough that
+        // probe runs wrap past the end and fill up.
+        // Then the engine's own sizes at both slot densities, roomy and
+        // overflowing into the interner.
+        let mut sizes = vec![(16_384usize, 6_000u64), (12_289, 4_000), (4_099, 3_000), (97, 2_000), (37, 40), (1, 5)];
+        for (bytes, per, values) in [(30_000_000, 190, 60_000), (3_000_000, 190, 30_000), (30_000_000, 2048, 20_000), (300_000, 2048, 9_000)] {
+            let n = slots_for(bytes, per);
+            assert!(n >= 4096 && n <= MAX_SLOTS && n as u64 == (bytes / per).max(4096));
+            sizes.push((n, values));
+        }
+        for (n, values) in sizes {
+            let slots: Vec<Slot> = (0..n).map(|_| Slot { lo: AtomicU64::new(0), hi: AtomicU64::new(0) }).collect();
             let addr = slots.as_ptr() as usize;
             let value = |v: u64| {
                 let mut s = v.wrapping_mul(0x2545_F491_4F6C_DD1D) + 1;
@@ -629,7 +751,7 @@ mod tests {
                 let handles: Vec<_> = (0..8u64)
                     .map(|t| {
                         scope.spawn(move || {
-                            let table = HexTable { slots: addr as *const Slot, bits };
+                            let table = HexTable { slots: addr as *const Slot, n };
                             let mut got = vec![None; values as usize];
                             let mut state = t + 1;
                             for _ in 0..values * 6 {
@@ -650,7 +772,7 @@ mod tests {
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             });
-            let table = HexTable { slots: addr as *const Slot, bits };
+            let table = HexTable { slots: addr as *const Slot, n };
             let mut owner = std::collections::HashMap::new();
             let mut placed = 0;
             for v in 0..values {
@@ -663,10 +785,18 @@ mod tests {
                     assert!(owner.insert(slot, v).is_none(), "one value a slot");
                 }
             }
-            if bits == 14 {
+            // A run that starts in the last 31 slots goes on at slot 0.
+            let wrapped = owner.keys().filter(|&&slot| (slot as usize) < PROBES).count();
+            if values * 2 <= n as u64 {
                 assert_eq!(placed, values, "a roomy table places everything");
             } else {
                 assert!(placed < values && placed > 0, "a small table refuses some: {placed} of {values}");
+                if n <= 97 {
+                    assert_eq!(placed, n as u64, "a full table: every slot taken");
+                }
+            }
+            if n == 97 {
+                assert!(wrapped > 0, "runs wrap at the end");
             }
         }
     }
